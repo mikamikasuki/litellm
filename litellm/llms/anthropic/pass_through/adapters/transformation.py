@@ -1,3 +1,5 @@
+import base64
+import binascii
 import copy
 import hashlib
 import json
@@ -21,6 +23,28 @@ TOOL_NAME_HASH_LENGTH: Final = 8
 TOOL_NAME_PREFIX_LENGTH: Final = OPENAI_MAX_TOOL_NAME_LENGTH - TOOL_NAME_HASH_LENGTH - 1  # 55
 PROVIDERS_PROXYING_AN_UNKNOWN_BACKEND: Final = frozenset({"litellm_proxy"})
 _COMPACTION_BLOCK: Final = TypeAdapter(dict[str, JsonValue])
+_ANTHROPIC_THOUGHT_SIGNATURE_MARKER: Final = "__gemini_thought__"
+
+
+def _encode_anthropic_tool_use_id(raw_id: str, signature: str | None) -> str:
+    base_id: Final = normalize_anthropic_tool_use_id(raw_id)
+    if not signature:
+        return base_id
+    encoded: Final = base64.urlsafe_b64encode(signature.encode()).decode().rstrip("=")
+    return f"{base_id}{_ANTHROPIC_THOUGHT_SIGNATURE_MARKER}{encoded}"
+
+
+def _restore_anthropic_tool_use_id(raw_id: str) -> tuple[str, str | None]:
+    if _ANTHROPIC_THOUGHT_SIGNATURE_MARKER not in raw_id:
+        return raw_id, None
+    base_id, encoded = raw_id.rsplit(_ANTHROPIC_THOUGHT_SIGNATURE_MARKER, 1)
+    if not encoded:
+        return raw_id, None
+    try:
+        signature: Final = base64.b64decode(encoded + "=" * (-len(encoded) % 4), altchars=b"-_", validate=True).decode()
+    except (binascii.Error, UnicodeDecodeError):
+        return raw_id, None
+    return f"{base_id}{THOUGHT_SIGNATURE_SEPARATOR}{signature}", signature
 
 
 def _optional_attr(source: object, name: str) -> object:
@@ -368,6 +392,13 @@ class LiteLLMAnthropicMessagesAdapter:
         if function_fields:
             return _thought_signature(function_fields)
 
+        raw_id: Final = _optional_attr(tool_call, "id")
+        if not isinstance(raw_id, str):
+            return None
+        if signature := _restore_anthropic_tool_use_id(raw_id)[1]:
+            return signature
+        if THOUGHT_SIGNATURE_SEPARATOR in raw_id:
+            return raw_id.split(THOUGHT_SIGNATURE_SEPARATOR, 1)[1]
         return None
 
     def _extract_signature_from_tool_use_content(self, content: Mapping[str, object]) -> str | None:
@@ -377,8 +408,10 @@ class LiteLLMAnthropicMessagesAdapter:
         provider_specific_fields: Final = _as_string_mapping(content.get("provider_specific_fields", {}))
         if provider_specific_fields:
             signature: Final = provider_specific_fields.get("signature")
-            return signature if isinstance(signature, str) else None
-        return None
+            if isinstance(signature, str):
+                return signature
+        raw_id: Final = content.get("id")
+        return _restore_anthropic_tool_use_id(raw_id)[1] if isinstance(raw_id, str) else None
 
     def _add_cache_control_if_applicable(
         self,
@@ -525,9 +558,15 @@ class LiteLLMAnthropicMessagesAdapter:
                                 self._add_cache_control_if_applicable(content, doc_obj, model)
                                 new_user_content_list.append(doc_obj)
                         elif content.get("type") == "tool_result":
+                            raw_tool_use_id: Final = content.get("tool_use_id", "")
+                            restored_tool_use_id: Final = (
+                                _restore_anthropic_tool_use_id(raw_tool_use_id)[0]
+                                if isinstance(raw_tool_use_id, str)
+                                else ""
+                            )
                             tool_result = ChatCompletionToolMessage(
                                 role="tool",
-                                tool_call_id=content.get("tool_use_id", ""),
+                                tool_call_id=restored_tool_use_id,
                                 content=self._tool_result_content(content.get("content")),
                             )
                             self._add_cache_control_if_applicable(content, tool_result, model)
@@ -583,8 +622,14 @@ class LiteLLMAnthropicMessagesAdapter:
                                     provider_specific_fields["thought_signature"] = signature
                                     function_chunk["provider_specific_fields"] = provider_specific_fields
 
+                                raw_tool_use_id: Final = content.get("id", "")
+                                restored_tool_use_id: Final = (
+                                    _restore_anthropic_tool_use_id(raw_tool_use_id)[0]
+                                    if isinstance(raw_tool_use_id, str)
+                                    else ""
+                                )
                                 tool_call = ChatCompletionAssistantToolCall(
-                                    id=content.get("id", ""),
+                                    id=restored_tool_use_id,
                                     type="function",
                                     function=function_chunk,
                                 )
@@ -1415,7 +1460,7 @@ class LiteLLMAnthropicMessagesAdapter:
                     raw_id = tool_call.id or ""
                     tool_use_block = AnthropicResponseContentBlockToolUse(
                         type="tool_use",
-                        id=normalize_anthropic_tool_use_id(raw_id),
+                        id=_encode_anthropic_tool_use_id(raw_id, signature),
                         name=original_name,
                         input=parse_tool_call_arguments(
                             tool_call.function.arguments,
@@ -1643,7 +1688,7 @@ class LiteLLMAnthropicMessagesAdapter:
                     thought_sig = parts[1] if len(parts) > 1 else None
                 tool_block: dict[str, object] = {
                     "type": "tool_use",
-                    "id": normalize_anthropic_tool_use_id(raw_id),
+                    "id": _encode_anthropic_tool_use_id(raw_id, thought_sig),
                     "name": tool_name,
                     "input": {},
                 }

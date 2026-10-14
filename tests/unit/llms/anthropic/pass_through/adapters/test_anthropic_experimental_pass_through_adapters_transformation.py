@@ -201,8 +201,8 @@ def test_translate_streaming_openai_chunk_to_anthropic_content_block():
     }
 
 
-def test_translate_streaming_openai_chunk_strips_gemini_thought_from_tool_call_id():
-    """Gemini embeds thought signatures in OpenAI tool ids; Anthropic SSE should expose a clean id."""
+def test_translate_streaming_openai_chunk_preserves_gemini_signature_in_safe_id():
+    """Anthropic SSE IDs carry Gemini signatures through clients that drop extensions."""
     base = "call_3e9417b7925e49aca9a71dc1885e"
     sig = "CiIBDDnWx"
     combined = f"{base}{THOUGHT_SIGNATURE_SEPARATOR}{sig}"
@@ -218,9 +218,7 @@ def test_translate_streaming_openai_chunk_strips_gemini_thought_from_tool_call_i
                 tool_calls=[
                     ChatCompletionDeltaToolCall(
                         id=combined,
-                        function=Function(
-                            arguments='{"a": 17, "b": 25}', name="add_numbers"
-                        ),
+                        function=Function(arguments='{"a": 17, "b": 25}', name="add_numbers"),
                         type="function",
                         index=0,
                     )
@@ -237,7 +235,9 @@ def test_translate_streaming_openai_chunk_strips_gemini_thought_from_tool_call_i
     ) = LiteLLMAnthropicMessagesAdapter().translate_streaming_openai_chunk_to_anthropic_content_block(choices=choices)
 
     assert block_type == "tool_use"
-    assert content_block_start["id"] == base
+    encoded = base64.urlsafe_b64encode(sig.encode()).decode().rstrip("=")
+    assert content_block_start["id"] == f"{base}__gemini_thought__{encoded}"
+    assert all(character.isalnum() or character in "_-" for character in content_block_start["id"])
     assert content_block_start["name"] == "add_numbers"
     assert content_block_start["input"] == {}
     assert content_block_start["provider_specific_fields"]["signature"] == sig
@@ -1169,12 +1169,10 @@ def test_translate_openai_content_to_anthropic_text_and_tool_calls():
     assert result[1]["input"] == {"location": "Boston"}
 
 
-def test_translate_openai_content_to_anthropic_strips_gemini_thought_from_tool_call_id():
+def test_translate_openai_content_to_anthropic_preserves_gemini_signature_in_safe_id():
     """
-    Non-streaming path must strip the Gemini thought-signature suffix from
-    tool_call.id, same as the streaming path. The base64 signature contains
-    `+ / =` which violate Anthropic's `^[a-zA-Z0-9_-]+$` tool_use.id pattern
-    and 400 when the history is replayed to an Anthropic-native provider.
+    The tool ID must carry the signature through Anthropic clients that discard
+    provider-specific fields, while remaining valid for Anthropic's ID pattern.
     """
     base = "call_3e9417b7925e49aca9a71dc1885e"
     sig = "CiIBDDnWx+/a=="
@@ -1205,11 +1203,45 @@ def test_translate_openai_content_to_anthropic_strips_gemini_thought_from_tool_c
 
     assert len(result) == 1
     assert result[0]["type"] == "tool_use"
-    assert result[0]["id"] == base
-    assert THOUGHT_SIGNATURE_SEPARATOR not in result[0]["id"]
+    encoded = base64.urlsafe_b64encode(sig.encode()).decode().rstrip("=")
+    assert result[0]["id"] == f"{base}__gemini_thought__{encoded}"
+    assert all(character.isalnum() or character in "_-" for character in result[0]["id"])
     assert result[0]["name"] == "get_weather"
     assert result[0]["input"] == {"location": "Boston"}
     assert result[0]["provider_specific_fields"] == {"signature": sig}
+
+
+def test_anthropic_standard_tool_use_id_roundtrips_gemini_signature_and_result_id():
+    signature = "CiIBDDnWx+/a=="
+    base_id = "call_abc123"
+    encoded = base64.urlsafe_b64encode(signature.encode()).decode().rstrip("=")
+    wire_id = f"{base_id}__gemini_thought__{encoded}"
+    messages = [
+        AnthropicMessagesUserMessageParam(role="user", content="weather"),
+        AnthopicMessagesAssistantMessageParam(
+            role="assistant",
+            content=[
+                {
+                    "type": "tool_use",
+                    "id": wire_id,
+                    "name": "get_weather",
+                    "input": {"location": "London"},
+                }
+            ],
+        ),
+        AnthropicMessagesUserMessageParam(
+            role="user",
+            content=[{"type": "tool_result", "tool_use_id": wire_id, "content": "sunny"}],
+        ),
+    ]
+
+    result = LiteLLMAnthropicMessagesAdapter().translate_anthropic_messages_to_openai(messages=messages)
+
+    expected_internal_id = f"{base_id}{THOUGHT_SIGNATURE_SEPARATOR}{signature}"
+    assistant_tool_call = result[1]["tool_calls"][0]
+    assert assistant_tool_call["id"] == expected_internal_id
+    assert assistant_tool_call["function"]["provider_specific_fields"]["thought_signature"] == signature
+    assert result[2]["tool_call_id"] == expected_internal_id
 
 
 def test_translate_openai_content_to_anthropic_sanitizes_colon_dot_tool_call_ids():
